@@ -168,7 +168,7 @@ resources:
                       }
                     }
                   }' \
-                    https://sztaki.cloud.mta.hu:5000/v3/auth/tokens\`
+                    $keystone_url\`
         response_code=\`echo \$response | head -n 1 | cut -d\$' ' -f2\`
         if [ \$response_code = '201' ]
         then
