@@ -1,0 +1,266 @@
+heat_template_version: 2013-05-23
+
+description: >-
+  OpenVPN server with public IP
+
+parameters:
+  key_name:
+    type: string
+    label: Keypair Name
+    description: Name of a KeyPair to enable SSH access to the instance.
+    constraints:
+      - custom_constraint: nova.keypair
+  instance_type:
+    type: string
+    label: Nova flavor
+    description: Instance type for the OpenVPN server.
+    constraints:
+      - custom_constraint: nova.flavor
+  image_id:
+    type: string
+    label: Image
+    description: ID of the image to use for the OpenVPN server (Tested only with ubuntu 14.04 LTS).
+    constraints:
+      - custom_constraint: glance.image
+  private_net_id:
+    type: string
+    label: Private Network
+    description: Private network in which OpenVPN will be linked.
+    constraints:
+      - custom_constraint: neutron.network
+  vpn_cidr:
+    type: string
+    default: 10.8.0.0/24
+    description: OpenVPN CIDR. It has to be unique and must not overlap the CIDR of your private_net_id, public_net_id, and neither of your clients connecting to the VPN.
+  floating_ip:
+    label: Public IP
+    type: string
+    description: Floating IP of the server.
+
+resources:
+
+#Create security groups for OpenVPN and ssh
+  secgroup-ovpn:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable traffic external traffic on UDP:1194 for openVpn trafic
+      rules: [{protocol: tcp, port_range_max: 1194, port_range_min: 1194},]
+
+  secgroup-ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable traffic external traffic on SSH.
+      rules: [{protocol: tcp, port_range_max: 22, port_range_min: 22},]
+
+  secgroup-internal:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable all traffic between instances.
+      rules: [{protocol: tcp, port_range_max: 65535, port_range_min: 1, remote_mode: remote_group_id},]
+
+# Install OpenVPN
+
+  openvpn_install:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        sudo apt -f -y install openvpn easy-rsa ipcalc curl
+
+  openvpn_key_gen:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      outputs:
+        - name: ovpn_crt
+      group: script
+      config: |
+        #!/bin/bash
+        sudo cp -r /usr/share/easy-rsa/ /etc/openvpn
+        sudo mkdir /etc/openvpn/easy-rsa/keys
+        sudo sed -i 's/export KEY_COUNTRY="US"/export KEY_COUNTRY="HU"/' /etc/openvpn/easy-rsa/vars
+        sudo sed -i 's/export KEY_PROVINCE="Budapest"/export KEY_PROVINCE="Budapest"/' /etc/openvpn/easy-rsa/vars
+        sudo sed -i 's/export KEY_CITY="Budapest"/export KEY_CITY="Budapest"/' /etc/openvpn/easy-rsa/vars
+        sudo sed -i 's/export KEY_ORG="MTA"/export KEY_CITY="MTA"/' /etc/openvpn/easy-rsa/vars
+        sudo sed -i 's/export KEY_EMAIL="me@myhost.mydomain"/export KEY_EMAIL="'$public_ip'"/' /etc/openvpn/easy-rsa/vars
+        sudo sed -i 's/export KEY_OU="me@myhost.mydomain"/export KEY_OU="MTA"/' /etc/openvpn/easy-rsa/vars
+        sudo sed -i 's/export KEY_NAME="EasyRSA"/export KEY_NAME="server"/' /etc/openvpn/easy-rsa/vars
+        sudo openssl dhparam -out /etc/openvpn/dh2048.pem 2048 > /dev/null
+        cd /etc/openvpn/easy-rsa
+        source vars > /dev/null 
+        sudo -E ./clean-all > /dev/null
+        sudo -E ./build-ca --batch > /dev/null
+        sudo -E ./build-key-server --batch server > /dev/null
+        sudo cp /etc/openvpn/easy-rsa/keys/{server.crt,server.key,ca.crt} /etc/openvpn
+        sudo cat /etc/openvpn/ca.crt
+
+  openvpn_server_conf:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      inputs:
+        - name: vpncidr
+      group: script
+      config: |
+        #!/bin/bash
+        export private_ip_cidr=`add | grep `curl 169.254.169.254/latest/meta-data/local-ipv4` | xargs | cut -d" " -f2`
+        export private_net_cidr=`ipcalc -nb $private_ip_cidr | grep ^Network | awk '{print $2}'`
+        export private_net_ip=`ipcalc -nb $private_net_cidr | grep ^Address | awk '{print $2}'`
+        export private_net_mask=`ipcalc -nb $private_net_cidr | grep ^Netmask | awk '{print $2}'`
+        sudo cat > /etc/openvpn/up.sh <<EOF
+        #!/bin/bash
+        sudo /sbin/iptables -t nat -A POSTROUTING -s ${vpncidr} -j MASQUERADE
+        EOF
+        sudo chmod 700 /etc/openvpn/up.sh
+        sudo cat > /etc/openvpn/server.conf <<EOF
+        port 1194
+        proto tcp
+        dev tun
+        ca /etc/openvpn/ca.crt
+        cert /etc/openvpn/server.crt
+        key /etc/openvpn/server.key
+        dh /etc/openvpn/dh2048.pem
+        server $(ipcalc -nb ${vpncidr} | grep ^Address | awk '{print $2}') $(ipcalc -nb ${vpncidr} | grep ^Netmask | awk '{print $2}')
+        ifconfig-pool-persist ipp.txt
+        keepalive 10 120
+        comp-lzo
+        persist-key
+        persist-tun
+        verb 3
+        script-security 3
+        client-cert-not-required
+        auth-user-pass-verify keystone-auth.sh via-env
+        push "route $private_net_ip $private_net_mask"
+        up /etc/openvpn/up.sh
+        EOF
+        sudo echo net.ipv4.ip_forward=1 >> /etc/sysctl.conf
+        sudo sysctl -p
+
+  openvpn_keystone_auth:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      inputs:
+        - name: project_id
+      group: script
+      config: |
+        #!/bin/bash
+        sudo cat > /etc/openvpn/keystone-auth.sh <<EOF
+        #!/bin/bash
+        keystone_url='https://sztaki.cloud.mta.hu:5000/v3'
+        response=\`curl -i \
+                    -H "Content-Type: application/json" \
+                    -d '
+                  { "auth": {
+                      "identity": {
+                        "methods": ["password"],
+                        "password": {
+                          "user": {
+                            "name": "'"\$username"'",
+                            "domain": { "id": "default" },
+                            "password": "'"\$password"'"
+                          }
+                        }
+                      },
+                      "scope": {
+                        "project": {
+                          "id": "$project_id",
+                          "domain": { "id": "default" }
+                        }
+                      }
+                    }
+                  }' \
+                    https://sztaki.cloud.mta.hu:5000/v3/auth/tokens\`
+        response_code=\`echo \$response | head -n 1 | cut -d\$' ' -f2\`
+        if [ \$response_code = '201' ]
+        then
+          exit 0
+        else
+          exit 1
+        fi
+        EOF
+        chmod 700 /etc/openvpn/keystone-auth.sh
+
+  openvpn_start:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        sudo systemctl enable openvpn@server
+        sudo systemctl start openvpn@server
+
+  do_openvpn_install:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: openvpn_install
+      server:
+        get_resource: openvpn_server
+
+  do_openvpn_key_gen:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: do_openvpn_install
+    properties:
+      config:
+        get_resource: openvpn_key_gen
+      server:
+        get_resource: openvpn_server
+
+  do_openvpn_server_conf:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: do_openvpn_install
+    properties:
+      input_values:
+        vpncidr: {get_param: vpn_cidr}
+      config:
+        get_resource: openvpn_server_conf
+      server:
+        get_resource: openvpn_server
+
+  do_openvpn_keystone_auth:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: do_openvpn_install
+    properties:
+      input_values:
+        project_id: {get_param: "OS::project_id"}
+      config:
+        get_resource: openvpn_keystone_auth
+      server:
+        get_resource: openvpn_server
+
+  do_openvpn_start:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: [do_openvpn_keystone_auth, do_openvpn_server_conf, do_openvpn_key_gen]
+    properties:
+      config:
+        get_resource: openvpn_start
+      server:
+        get_resource: openvpn_server
+
+# Create server and associate floating IP to it
+
+  openvpn_server:
+    type: OS::Nova::Server
+    properties:
+      name: OpenVPN
+      image: { get_param: image_id }
+      flavor: { get_param: instance_type }
+      key_name: { get_param: key_name }
+      security_groups:
+      - { get_resource: secgroup-ovpn }
+      - { get_resource: secgroup-ssh }
+      - { get_resource: secgroup-internal }
+      networks:
+      - network:
+          get_param: private_net_id
+      user_data_format: SOFTWARE_CONFIG
+
+  IPAssoc :
+    type : AWS::EC2::EIPAssociation
+    properties :
+        InstanceId : { get_resource: openvpn_server }
+        EIP : { get_param : floating_ip }
+
+outputs:
+  OpenVPN:
+    description: The certificate of the OpenVPN server.
+    value: { get_attr: [do_openvpn_key_gen, deploy_stdout] }
