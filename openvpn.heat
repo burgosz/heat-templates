@@ -99,6 +99,7 @@ resources:
     properties:
       inputs:
         - name: vpncidr
+        - name: public
       group: script
       config: |
         #!/bin/bash
@@ -133,7 +134,21 @@ resources:
         up /etc/openvpn/up.sh
         EOF
         sudo echo net.ipv4.ip_forward=1 >> /etc/sysctl.conf
-        sudo sysctl -p
+        sudo sysctl -p > /dev/null
+        cat <<EOF
+        client
+        dev tun
+        proto tcp
+        remote ${public} 1194
+        resolv-retry infinite
+        nobind
+        persist-key
+        persist-tun
+        ca /etc/openvpn/${public}/ca.crt
+        ns-cert-type server
+        auth-user-pass /etc/openvpn/${public}/${public}.secret
+        comp-lzo
+        EOF
 
   openvpn_keystone_auth:
     type: OS::Heat::SoftwareConfig
@@ -211,6 +226,7 @@ resources:
     properties:
       input_values:
         vpncidr: {get_param: vpn_cidr}
+        public: {get_param: floating_ip}
       config:
         get_resource: openvpn_server_conf
       server:
@@ -261,6 +277,9 @@ resources:
         EIP : { get_param : floating_ip }
 
 outputs:
-  OpenVPN:
+  OpenVPN ca certificate:
     description: The certificate of the OpenVPN server.
     value: { get_attr: [do_openvpn_key_gen, deploy_stdout] }
+  OpenVPN client config:
+    description: OpenVPN client config.
+    value: { get_attr: [do_openvpn_server_conf, deploy_stdout] }
