@@ -160,7 +160,7 @@ resources:
         #!/bin/bash
         sudo cat > /etc/openvpn/keystone-auth.sh <<EOF
         #!/bin/bash
-        keystone_url='https://sztaki.cloud.mta.hu:5000/v3'
+        keystone_url='https://sztaki.cloud.mta.hu:5000/v3/auth/tokens'
         response=\`curl -i \
                     -H "Content-Type: application/json" \
                     -d '
@@ -183,7 +183,7 @@ resources:
                       }
                     }
                   }' \
-                    $keystone_url\`
+                    \$keystone_url\`
         response_code=\`echo \$response | head -n 1 | cut -d\$' ' -f2\`
         if [ \$response_code = '201' ]
         then
