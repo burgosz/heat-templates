@@ -103,7 +103,7 @@ resources:
       group: script
       config: |
         #!/bin/bash
-        export private_ip_cidr=`add | grep `curl 169.254.169.254/latest/meta-data/local-ipv4` | xargs | cut -d" " -f2`
+        export private_ip_cidr=`add | grep $(curl 169.254.169.254/latest/meta-data/local-ipv4) | xargs | cut -d" " -f2`
         export private_net_cidr=`ipcalc -nb $private_ip_cidr | grep ^Network | awk '{print $2}'`
         export private_net_ip=`ipcalc -nb $private_net_cidr | grep ^Address | awk '{print $2}'`
         export private_net_mask=`ipcalc -nb $private_net_cidr | grep ^Netmask | awk '{print $2}'`
